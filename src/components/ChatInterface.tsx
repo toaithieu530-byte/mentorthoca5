@@ -886,14 +886,15 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
 
     task.isFetching = true;
 
-    // Helper: fetch audio blob → base64
+    // Helper: fetch audio blob → base64 (preserve actual mime type)
     const toBase64 = async (res: Response): Promise<string> => {
+      const mime = res.headers.get('content-type')?.split(';')[0]?.trim() || 'audio/mpeg';
       const buf = await res.arrayBuffer();
       const bytes = new Uint8Array(buf);
       let bin = '';
       for (let i = 0; i < bytes.length; i += 0x8000)
         bin += String.fromCharCode(...bytes.slice(i, i + 0x8000));
-      return `data:audio/mpeg;base64,${btoa(bin)}`;
+      return `data:${mime};base64,${btoa(bin)}`;
     };
 
     try {
