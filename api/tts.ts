@@ -1,22 +1,18 @@
-const FPT_KEY = 'IUUGMkDMX7cMAjfNnISBAJ64pkLP7q70';
+const XI_KEY   = 'deaa774bedb654e1a9adf6ef823335b3ec9cf705b20934e601e4dd8906e1632c';
+const VOICE_ID = '5vqV9IG7sDpzgzKOIZAv';
 
 export const config = { api: { bodyParser: false } };
 
 const readBody = (req: any): Promise<string> =>
   new Promise((resolve, reject) => {
     let data = '';
-    req.on('data', (chunk: Buffer) => { data += chunk.toString(); });
+    req.on('data', (c: Buffer) => { data += c.toString(); });
     req.on('end', () => resolve(data));
     req.on('error', reject);
   });
 
 export default async function handler(req: any, res: any) {
-  if (req.method !== 'POST') {
-    res.status(405).json({ error: 'Method not allowed' });
-    return;
-  }
-
-  const apiKey = (process.env.FPT_TTS_API_KEY?.trim()) || FPT_KEY;
+  if (req.method !== 'POST') { res.status(405).end(); return; }
 
   let text = '';
   try {
@@ -27,45 +23,43 @@ export default async function handler(req: any, res: any) {
 
   if (!text) { res.status(400).json({ error: 'text is required' }); return; }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000);
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 30000);
 
   try {
-    const fptRes = await fetch('https://api.fpt.ai/hmi/tts/v5', {
-      method: 'POST',
-      headers: { 'api-key': apiKey, 'voice': 'linhsan', 'speed': '' },
-      body: text,
-      signal: controller.signal,
-    });
+    const r = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`,
+      {
+        method: 'POST',
+        headers: {
+          'xi-api-key': process.env.ELEVENLABS_API_KEY || XI_KEY,
+          'Content-Type': 'application/json',
+          'Accept': 'audio/mpeg',
+        },
+        body: JSON.stringify({
+          text,
+          model_id: 'eleven_multilingual_v2',
+          output_format: 'mp3_44100_128',
+          voice_settings: { stability: 0.5, similarity_boost: 0.8, style: 0.3, use_speaker_boost: true },
+        }),
+        signal: ctrl.signal,
+      }
+    );
 
-    if (!fptRes.ok) {
-      const err = await fptRes.text();
-      res.status(502).json({ error: `FPT ${fptRes.status}: ${err}` });
+    if (!r.ok) {
+      const e = await r.text();
+      res.status(502).json({ error: `ElevenLabs ${r.status}: ${e}` });
       return;
     }
 
-    const json = await fptRes.json();
-    const audioUrl: string | undefined = json?.async;
-    if (!audioUrl) { res.status(502).json({ error: `No URL: ${JSON.stringify(json)}` }); return; }
+    const buf = await r.arrayBuffer();
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(200).send(Buffer.from(buf));
 
-    for (let i = 0; i < 10; i++) {
-      await new Promise(r => setTimeout(r, i === 0 ? 1200 : 1500));
-      try {
-        const r = await fetch(audioUrl, { signal: controller.signal });
-        if (r.ok) {
-          const buf = await r.arrayBuffer();
-          res.setHeader('Content-Type', 'audio/mpeg');
-          res.setHeader('Cache-Control', 'no-store');
-          res.status(200).send(Buffer.from(buf));
-          return;
-        }
-      } catch { /* retry */ }
-    }
-    res.status(502).json({ error: 'FPT: no audio after retries' });
-
-  } catch (err: any) {
-    res.status(502).json({ error: err?.name === 'AbortError' ? 'Timeout' : err?.message });
+  } catch (e: any) {
+    res.status(502).json({ error: e?.name === 'AbortError' ? 'Timeout' : e?.message });
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(t);
   }
 }

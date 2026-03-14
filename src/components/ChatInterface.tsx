@@ -295,8 +295,6 @@ interface AudioTask {
   isReady: boolean;
   isFailed: boolean;
   base64Audio?: string;
-  nativePlay?: () => Promise<void>;   // Web Speech API (free, Vietnamese)
-  puterPlay?: () => Promise<void>;    // Puter ElevenLabs fallback
   onStart?: () => void;
   onEnd?: () => void;
 }
@@ -871,7 +869,6 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
   const stopAllAudio = () => {
     audioTasks.current = [];
     isPlayingAudio.current = false;
-    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
   };
 
   const addAudioTask = (text: string, onStart?: () => void, onEnd?: () => void) => {
@@ -881,124 +878,7 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
   };
 
 
-  // ── WEB SPEECH API ──────────────────────────────────────────────────
-  // Fallback: Vietnamese voice from browser (always keep vi-VN lang)
-  const createWebSpeechPlayer = (text: string): (() => Promise<void>) | null => {
-    if (!('speechSynthesis' in window)) return null;
-
-    return () => new Promise<void>((resolve) => {
-      window.speechSynthesis.cancel();
-      const utter = new SpeechSynthesisUtterance(text);
-      utter.lang = 'vi-VN';   // KHÔNG bao giờ thay đổi — giữ tiếng Việt
-      utter.rate = 0.82;
-      utter.pitch = 1.05;
-
-      utter.onend = () => resolve();
-      utter.onerror = () => resolve();
-
-      const doSpeak = (voices: SpeechSynthesisVoice[]) => {
-        const viVoices = voices.filter(v =>
-          v.lang.startsWith('vi') || v.lang === 'vi'
-        );
-
-        if (viVoices.length > 0) {
-          // Ưu tiên: Google Wavenet nữ → bất kỳ Google vi → đầu tiên
-          const best =
-            viVoices.find(v => /wavenet-[ace]/i.test(v.name)) ||
-            viVoices.find(v => /google/i.test(v.name)) ||
-            viVoices[0];
-          utter.voice = best;
-        }
-        // Nếu không có vi-VN voice: KHÔNG set voice, chỉ giữ lang='vi-VN'
-        // Browser sẽ dùng TTS engine mặc định với ngôn ngữ tiếng Việt
-        // (tốt hơn nhiều so với dùng giọng tiếng Anh đọc tiếng Việt)
-
-        window.speechSynthesis.speak(utter);
-      };
-
-      const voices = window.speechSynthesis.getVoices();
-      if (voices.length > 0) {
-        doSpeak(voices);
-      } else {
-        let fired = false;
-        const onReady = () => {
-          if (fired) return;
-          fired = true;
-          window.speechSynthesis.removeEventListener('voiceschanged', onReady);
-          doSpeak(window.speechSynthesis.getVoices());
-        };
-        window.speechSynthesis.addEventListener('voiceschanged', onReady);
-        setTimeout(() => {
-          if (!fired) {
-            fired = true;
-            window.speechSynthesis.removeEventListener('voiceschanged', onReady);
-            // Timeout nhưng vẫn thử đọc với lang='vi-VN'
-            window.speechSynthesis.speak(utter);
-          }
-        }, 2500);
-      }
-    });
-  };
-
-  const createPuterElevenLabsPlayer = async (text: string): Promise<(() => Promise<void>) | null> => {
-    const puter = (window as any).puter;
-    if (!puter?.ai?.txt2speech) return null;
-
-    const audioLike = await puter.ai.txt2speech(text, {
-      provider: 'elevenlabs',
-      voice: PUTER_ELEVENLABS_VOICE_ID,
-      model: 'eleven_multilingual_v2',
-      output_format: 'mp3_44100_128',
-    });
-
-    return async () => {
-      if (audioLike?.pause) {
-        try {
-          audioLike.currentTime = 0;
-        } catch {}
-      }
-
-      await new Promise<void>((resolve, reject) => {
-        if (!audioLike || typeof audioLike.play !== 'function') {
-          reject(new Error('Puter txt2speech returned unsupported audio object'));
-          return;
-        }
-
-        const cleanup = () => {
-          if (typeof audioLike.removeEventListener === 'function') {
-            audioLike.removeEventListener('ended', onEnded);
-            audioLike.removeEventListener('error', onError);
-          }
-        };
-
-        const onEnded = () => {
-          cleanup();
-          resolve();
-        };
-
-        const onError = () => {
-          cleanup();
-          reject(new Error('Puter ElevenLabs playback failed'));
-        };
-
-        if (typeof audioLike.addEventListener === 'function') {
-          audioLike.addEventListener('ended', onEnded);
-          audioLike.addEventListener('error', onError);
-        }
-
-        Promise.resolve(audioLike.play())
-          .then(() => {
-            if (typeof audioLike.addEventListener !== 'function') {
-              resolve();
-            }
-          })
-          .catch((error: any) => {
-            cleanup();
-            reject(error);
-          });
-      });
-    };
-  };
+  // TTS: FPT AI only — no Web Speech, no Puter fallback
 
   const fetchNextAudio = async () => {
     const task = audioTasks.current.find(t => !t.isFetching && !t.isReady && !t.isFailed);
@@ -1020,78 +900,18 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
       // ── Ưu tiên 1: FPT AI TTS (giọng linhsan) ──
       const fptRes = await fetch(ELEVENLABS_TTS_ENDPOINT, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: task.text,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: task.text }),
       });
       if (!fptRes.ok) throw new Error(`FPT ${fptRes.status}: ${await fptRes.text()}`);
       task.base64Audio = await toBase64(fptRes);
       task.isReady = true;
       setTtsError(null);
     } catch (fptError: any) {
-      console.warn('FPT TTS failed, trying Google TTS:', fptError.message);
-      try {
-        // ── Ưu tiên 2: Google Translate TTS (free, giọng Việt tốt) ──
-        // Chia text thành chunks ≤ 180 ký tự để tránh giới hạn
-        const chunks: string[] = [];
-        const words = task.text.split(' ');
-        let chunk = '';
-        for (const w of words) {
-          if ((chunk + ' ' + w).trim().length > 160) {
-            if (chunk) chunks.push(chunk.trim());
-            chunk = w;
-          } else {
-            chunk = chunk ? chunk + ' ' + w : w;
-          }
-        }
-        if (chunk) chunks.push(chunk.trim());
-
-        const audioBuffers: ArrayBuffer[] = [];
-        for (const c of chunks) {
-          const url = `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=vi&q=${encodeURIComponent(c)}`;
-          const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-          if (!res.ok) throw new Error(`Google TTS chunk failed: ${res.status}`);
-          audioBuffers.push(await res.arrayBuffer());
-        }
-
-        // Ghép các chunk thành 1 audio
-        const total = audioBuffers.reduce((s, b) => s + b.byteLength, 0);
-        const merged = new Uint8Array(total);
-        let offset = 0;
-        for (const buf of audioBuffers) {
-          merged.set(new Uint8Array(buf), offset);
-          offset += buf.byteLength;
-        }
-        let bin = '';
-        for (let i = 0; i < merged.length; i += 0x8000)
-          bin += String.fromCharCode(...merged.slice(i, i + 0x8000));
-        task.base64Audio = `data:audio/mpeg;base64,${btoa(bin)}`;
-        task.isReady = true;
-        setTtsError(null);
-      } catch (googleError: any) {
-        console.warn('Google TTS failed, falling back to Web Speech:', googleError.message);
-        try {
-          // ── Ưu tiên 3: Web Speech API (vi-VN, giọng browser) ──
-          const webSpeechPlay = createWebSpeechPlayer(task.text);
-          if (!webSpeechPlay) throw new Error('Web Speech không khả dụng');
-          task.nativePlay = webSpeechPlay;
-          task.base64Audio = 'web-speech';
-          task.isReady = true;
-          setTtsError(null);
-        } catch (webErr: any) {
-          // ── Ưu tiên 4: Puter ElevenLabs (last resort) ──
-          try {
-            const puterPlay = await createPuterElevenLabsPlayer(task.text);
-            if (!puterPlay) throw new Error('Puter unavailable');
-            task.puterPlay = puterPlay;
-            task.base64Audio = 'puter-elevenlabs';
-            task.isReady = true;
-            setTtsError(null);
-          } catch {
-            task.isFailed = true;
-            setTtsError('Không phát được audio. Kiểm tra FPT_TTS_API_KEY trên Vercel.');
-          }
-        }
-      }
+      console.warn('FPT TTS failed:', fptError.message);
+      // Không còn fallback Web Speech — nếu FPT lỗi thì skip phần audio
+      task.isFailed = true;
+      setTtsError(`FPT TTS lỗi: ${fptError.message}. Kiểm tra FPT_TTS_API_KEY trên Vercel.`);
     } finally {
       task.isFetching = false;
       playNextAudio();
@@ -1113,11 +933,7 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
       isPlayingAudio.current = true;
       if (task.onStart) task.onStart();
       try {
-        if (task.nativePlay) {
-          await task.nativePlay();
-        } else if (task.puterPlay) {
-          await task.puterPlay();
-        } else if (task.base64Audio.startsWith('data:audio/')) {
+        if (task.base64Audio.startsWith('data:audio/')) {
           await new Promise<void>((resolve, reject) => {
             const audio = new Audio(task.base64Audio);
             audio.onended = () => resolve();
@@ -1133,6 +949,7 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
         playNextAudio();
       }
     } else {
+      // TTS failed nhưng vẫn gọi onEnd để chat không bị block
       if (task.onEnd) task.onEnd();
       playNextAudio();
     }
@@ -1635,7 +1452,14 @@ export function ChatInterface({ poem, author, onBack }: ChatInterfaceProps) {
               <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex justify-center py-4">
                 <div className="bg-[#f5f5f0] text-[#5A5A40] px-4 py-2 rounded-full text-sm flex items-center gap-2 shadow-sm border border-[#e0e0d8]">
                   <Volume2 className="w-4 h-4 animate-pulse" />
-                  Đang chuẩn bị phiên học: <span className="font-semibold">{poemTone}</span>
+                  Đang đọc bài thơ bằng giọng FPT...
+                </div>
+              </motion.div>
+            )}
+            {ttsError && (
+              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex justify-center py-2">
+                <div className="bg-red-50 text-red-700 px-4 py-2 rounded-xl text-xs border border-red-200 max-w-xs text-center">
+                  ⚠️ {ttsError}
                 </div>
               </motion.div>
             )}
